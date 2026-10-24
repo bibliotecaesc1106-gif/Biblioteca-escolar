@@ -65,7 +65,101 @@ $('coverFile').addEventListener('change',()=>{const f=$('coverFile').files[0];$(
 $('bookForm').addEventListener('submit',async e=>{e.preventDefault();if(!isAdmin)return;let id=$('bookId').value;let coverUrl=$('coverUrl').value||null;const file=$('coverFile').files[0];let obj={id:id||uid(),title:$('title').value.trim(),author:$('author').value.trim(),genre:$('genre').value.trim(),quantity:Number($('quantity').value),area:$('area').value.trim(),subarea:$('subarea').value.trim(),cycle:$('cycle').value.trim(),educational_level:$('educational_level').value,inventory_number:$('inventory_number').value.trim(),isbn:$('isbn').value.trim(),publisher:$('publisher').value.trim(),edition:$('edition').value.trim(),publication_place:$('publication_place').value.trim(),publication_year:$('publication_year').value?Number($('publication_year').value):null,pages:$('pages').value?Number($('pages').value):null,material_type:$('material_type').value,classification_code:$('classification_code').value.trim(),shelf_location:$('shelf_location').value.trim(),keywords:$('keywords').value.trim(),condition_status:$('condition_status').value,acquisition_source:$('acquisition_source').value,acquisition_date:$('acquisition_date').value||null,summary:$('summary').value.trim(),notes:$('notes').value.trim(),activity:$('activity').value.trim()};if(id&&obj.quantity<active(id)){alert('La cantidad no puede ser menor que los préstamos activos.');return}try{if(file){if(!file.type.startsWith('image/'))throw new Error('Elegí un archivo de imagen.');if(file.size>5*1024*1024)throw new Error('La imagen debe pesar menos de 5 MB.');const ext=(file.name.split('.').pop()||'jpg').toLowerCase().replace(/[^a-z0-9]/g,'')||'jpg';const path=`${obj.id}/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;const up=await db.storage.from('portadas-libros').upload(path,file,{cacheControl:'3600',upsert:false,contentType:file.type});if(up.error)throw up.error;coverUrl=db.storage.from('portadas-libros').getPublicUrl(path).data.publicUrl;}obj.cover_url=coverUrl;let r=await db.from('books').upsert(obj);if(r.error)throw r.error;resetBook();await load();msg('Libro guardado en Supabase.')}catch(x){alert('No se pudo guardar el libro: '+x.message)}})
 async function deleteBook(id){if(active(id)){alert('Primero registrá la devolución de los préstamos activos.');return}if(confirm('¿Eliminar este libro? Si tiene ejemplares registrados, primero habrá que resolverlos. ¿Continuar?')){let r=await db.from('books').delete().eq('id',id);if(r.error)alert(r.error.message);else load()}}
 
-function renderCopies(){const sorted=[...copies].sort((a,b)=>(a.inventory_number||'').localeCompare(b.inventory_number||''));$('copyTable').innerHTML=sorted.length?`<table><tr><th>Inventario</th><th>Libro</th><th>Estado</th></tr>${sorted.map(c=>`<tr><td>${esc(c.inventory_number)}</td><td>${esc(books.find(b=>b.id===c.book_id)?.title||c.book_id)}</td><td>${esc(c.condition_status||'Bueno')}</td></tr>`).join('')}</table>`:'<p>Todavía no hay ejemplares físicos cargados.</p>'}
+function renderCopies(){
+  const sorted = [...copies].sort((a,b) =>
+    String(a.inventory_number || '').localeCompare(String(b.inventory_number || ''), 'es')
+  );
+  $('copyTable').innerHTML = sorted.length ? `
+    <table>
+      <tr>
+        <th>N.º de inventario</th>
+        <th>Título</th>
+        <th>Autor</th>
+        <th>Estado</th>
+        <th>Acción</th>
+      </tr>
+      ${sorted.map(c => {
+        const book = books.find(b => String(b.id) === String(c.book_id));
+        return `<tr>
+          <td><input id="inventory-${esc(c.id)}" value="${esc(c.inventory_number || '')}"
+            aria-label="Número de inventario de ${esc(book?.title || 'ejemplar')}"
+            style="min-width:150px;margin:0" ${isAdmin ? '' : 'disabled'}></td>
+          <td>${esc(book?.title || 'Libro no encontrado')}</td>
+          <td>${esc(book?.author || 'Autor no registrado')}</td>
+          <td>${esc(c.condition_status || 'Bueno')}</td>
+          <td><button type="button" class="primary"
+            onclick="saveCopyInventory('${esc(c.id)}')" ${isAdmin ? '' : 'disabled'}>Guardar</button></td>
+        </tr>`;
+      }).join('')}
+    </table>` : '<p>Todavía no hay ejemplares físicos cargados.</p>';
+}
+
+async function saveCopyInventory(id){
+  if (!isAdmin) {
+    alert('Ingresá como administradora para modificar el inventario.');
+    return;
+  }
+
+  const copy = copies.find(c => String(c.id) === String(id));
+  if (!copy) {
+    alert('No se encontró el ejemplar seleccionado.');
+    return;
+  }
+
+  const input = $('inventory-' + id);
+  if (!input) return;
+  const number = input.value.trim();
+
+  if (!number) {
+    alert('El número de inventario no puede quedar vacío.');
+    input.focus();
+    return;
+  }
+
+  const duplicate = copies.some(c =>
+    String(c.id) !== String(id) &&
+    String(c.inventory_number || '').trim().toLocaleLowerCase('es') ===
+      number.toLocaleLowerCase('es')
+  );
+  if (duplicate) {
+    alert('Ese número de inventario ya está asignado a otro ejemplar. Elegí uno diferente.');
+    input.focus();
+    return;
+  }
+
+  if (number === String(copy.inventory_number || '').trim()) {
+    alert('El número de inventario no cambió.');
+    return;
+  }
+
+  const book = books.find(b => String(b.id) === String(copy.book_id));
+  if (!confirm(`¿Cambiar el inventario de "${book?.title || 'libro sin título'}" a "${number}"?`)) return;
+
+  const button = input.closest('tr')?.querySelector('button');
+  if (button) button.disabled = true;
+  try {
+    // Actualiza solo el registro existente: no crea ejemplares ni cambia sus IDs.
+    const result = await db.from('book_copies')
+      .update({ inventory_number: number })
+      .eq('id', copy.id)
+      .select('id, inventory_number');
+
+    if (result.error) throw result.error;
+    if (!result.data || result.data.length !== 1) {
+      throw new Error('Supabase no confirmó la actualización. Revisá los permisos de la tabla book_copies.');
+    }
+
+    copy.inventory_number = result.data[0].inventory_number;
+    renderCopies();
+    renderBarcodePreview();
+    renderLoans();
+    fillLoanBooks();
+    alert('Número de inventario actualizado correctamente.');
+  } catch (error) {
+    if (button) button.disabled = false;
+    alert('No se pudo guardar el número de inventario: ' + (error.message || error));
+  }
+}
 async function prepareCopies(){if(!isAdmin)return;if(!confirm('Se crearán solamente los ejemplares que falten para alcanzar la cantidad indicada en cada libro. ¿Continuar?'))return;try{const existingNumbers=new Set(copies.map(c=>String(c.inventory_number)));let pending=[];for(const b of books){const current=bookCopies(b.id).length;const target=Math.max(0,Number(b.quantity||0));for(let i=current;i<target;i++){let number=(i===0&&b.inventory_number)?String(b.inventory_number).trim():'';if(!number||existingNumbers.has(number)){let base=`AUTO-${String(b.id).replace(/[^a-zA-Z0-9]/g,'').slice(0,12)||'LIBRO'}-${i+1}`;number=base;let n=2;while(existingNumbers.has(number)){number=base+'-'+n++;}}existingNumbers.add(number);pending.push({book_id:b.id,inventory_number:number,condition_status:b.condition_status||'Bueno'});}}if(!pending.length){alert('No faltan ejemplares por crear.');return}const r=await db.from('book_copies').insert(pending);if(r.error)throw r.error;alert(`Se crearon ${pending.length} ejemplares.`);await load()}catch(e){alert('No se pudieron preparar los ejemplares: '+(e.message||e))}}
 function renderPeople(){$('peopleTable').innerHTML=people.length?`<table><tr><th>Nombre</th><th>Tipo</th><th>Curso/área</th><th>Acciones</th></tr>${people.map(p=>`<tr><td>${esc(p.name)}</td><td>${esc(p.role)}</td><td>${esc(p.group)}</td><td><button onclick="editPerson('${p.id}')">Editar</button> <button class="danger" onclick="deletePerson('${p.id}')">Eliminar</button></td></tr>`).join('')}</table>`:'<p>No hay personas registradas.</p>'}
 function editPerson(id){let p=people.find(x=>x.id===id);if(!p)return;$('personId').value=id;$('personName').value=p.name;$('role').value=p.role;$('group').value=p.group;$('personNotes').value=p.notes}
